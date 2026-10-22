@@ -1,0 +1,195 @@
+name: HIP image (gfx1101 + Zen 1)
+
+# The fork's own CI. It runs the fork's one step - tools/fork/build-hip.sh, which is upstream's
+# packaging/build_hip_linux.sh (engine + CPU picture reader + GPU picture reader + ROCm libraries + kernel
+# data, packaged as an engine component) and upstream's docker/build.sh --flavor hip, with -march=<level>
+# exported for cmake's first configure - and publishes the image on ghcr.io.
+#
+# What it proves: the CPU code of all three binaries is the x86-64 level the image is tagged with. The runner
+# is an AVX-512 Xeon, the PC this fork's image runs on is an AMD Zen 1, and tools/fork/check_hip_image.py
+# reads the machine code of the package and of the copy inside the image. A build that leaked AVX-512 stops
+# here, before the push, instead of as `illegal instruction` on someone's PC.
+#
+# What it cannot prove: the engine on an AMD card. Hosted runners have no GPU, so `strata components engine`
+# in the image reports no card and the model is never loaded. That step is docs/FORK_HIP_IMAGE.md's
+# "Start the image", and a report from a real card is what docs/COMMUNITY_BENCHMARKS.md asks for.
+#
+# Sizes measured on this fork's PC (RX 7800 XT / Threadripper 1950X): the released upstream engine package
+# for the same card family is 242 MB compressed (strata 93 MB, strata-vision 8 MB, strata-vision-hip 207 MB
+# unpacked), and docs/DOCKER.md puts the hip image at 2.4 GB on disk. The ROCm wheels the job installs are
+# ~10 GB, which is why the job frees disk first.
+#
+# Time, measured on the green run of this workflow (run 4, 23 Oct, commit 59657af): the whole job 28 min 15 s -
+# 1 min 55 s for the venv, the ~10 GB of ROCm wheels and llama.cpp, 21 min 14 s for the engine package at JOBS=8
+# on 4 cores, 1 min 52 s for the image (1 193 808 077 bytes) and 25 s for the push. The job's limit is 90 min and
+# the build step's own is 60; the 300 min limit of the first version sat 4 h 40 min in a container tool that
+# called itself and printed nothing - the story is in docs/FORK_HIP_IMAGE.md, "The CI".
+
+on:
+  workflow_dispatch:
+    inputs:
+      archs:
+        description: "gfx targets, ; separated (gfx1101 = RX 7800 XT / 7700 XT, gfx1100 = RX 7900 XT / XTX)"
+        default: gfx1101
+        type: string
+      cpu_march:
+        description: "gcc -march for the CPU kernels: znver1 = AMD Zen 1; native = the runner (AVX-512: runs only on such PCs)"
+        default: znver1
+        type: string
+      expect_vision:
+        description: "picture readers that must be in the image"
+        default: gpu
+        type: choice
+        options: [gpu, cpu, none]
+      push:
+        description: "push to ghcr.io"
+        default: true
+        type: boolean
+  push:
+    branches: [feature/hip-gfx1101-image]
+    paths:
+      - tools/fork/**
+      - packaging/**
+      - docker/**
+      - CMakeLists.txt
+      - cmake/**
+      - src/**
+      - include/**
+      - tools/vision/**
+      - setup.py
+      - requirements*.txt
+      - .github/workflows/hip-image.yml
+  pull_request:
+    paths:
+      - tools/fork/**
+      - packaging/**
+      - docker/**
+      - CMakeLists.txt
+      - cmake/**
+      - src/**
+      - include/**
+      - tools/vision/**
+      - setup.py
+      - requirements*.txt
+      - .github/workflows/hip-image.yml
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: hip-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ${{ github.repository_owner }}/strata-hip      # -> ghcr.io/<owner>/strata-hip
+  ARCHS: ${{ inputs.archs || 'gfx1101' }}
+  MARCH: ${{ inputs.cpu_march || 'znver1' }}
+  EXPECT_VISION: ${{ inputs.expect_vision || 'gpu' }}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    # 90 min, from the green run's 28 min 15 s: 1 min 55 s of venv and wheels, 21 min 14 s of engine package
+    # (JOBS=8 on 4 cores), 1 min 52 s of image, 25 s of push. The version before this one sat 4 h 40 min in a
+    # container tool that called itself and printed one line, and only spoke when the 300 min limit cancelled it:
+    # a limit that is near the work is what makes a stall visible.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # The two boolean inputs only exist on a manual run, and a boolean expression on an unset input reads
+      # as false, which would silently turn the push off on a push event. Spelled out in the shell instead.
+      - name: Defaults
+        run: |
+          case '${{ inputs.push }}' in false|False|0) push=false ;; *) push=true ;; esac
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then push=false; fi
+          echo "PUSH=$push" >> "$GITHUB_ENV"
+          # build-hip.sh's own name for the CPU level. The tag is built from MARCH, so the two must be one value:
+          # a manual run with cpu_march=znver3 that built at the script's default (znver1) would publish a znver3
+          # tag over a znver1 image. One source for both.
+          echo "CPU_MARCH=$MARCH" >> "$GITHUB_ENV"
+          echo "variant: $ARCHS at -$MARCH, picture readers that must be in the image: $EXPECT_VISION, push: $push"
+
+      # ~10 GB of ROCm wheels, the three build trees (the GPU picture reader is the big one) and the image.
+      # The SDKs this job never touches go first.
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL \
+                      /usr/local/lib/android /usr/local/.ghcup /usr/local/share/boost \
+                      "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force >/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential binutils patchelf curl git python3 python3-venv ca-certificates
+          df -h /
+
+      - name: Log in to GHCR
+        if: env.PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags
+        id: tags
+        run: |
+          lower() { printf '%s' "$1" | tr 'A-Z' 'a-z'; }
+          base="ghcr.io/$(lower "$IMAGE")"
+          tag="$(lower "${ARCHS%%;*}")-$(lower "$MARCH")"
+          {
+            echo "local=strata-hip:check-$tag"
+            echo "remote=$base:$tag,$base:$tag-$(printf '%s' "$GITHUB_SHA" | cut -c1-12)"
+          } >> "$GITHUB_OUTPUT"
+
+      # The fork's build: ROCm wheels, llama.cpp at the pinned commit, the three binaries at -march=$MARCH,
+      # the package, the check on the package, the image, the check on the image's copy. tee keeps the log in a
+      # file the Summary step can read, pipefail keeps the build's own exit code (tee never wins a pipeline).
+      - name: Build the engine package and the image
+        timeout-minutes: 60
+        env:
+          BIN: docker
+          JOBS: "8"                                      # 8 clang jobs at ~2 GB each on a 16 GB runner
+          TAG: ${{ steps.tags.outputs.local }}
+        run: |
+          set -o pipefail
+          tools/fork/build-hip.sh 2>&1 | tee "$RUNNER_TEMP/build-hip.log"
+
+      # The lines that matter, in the run's summary: the instruction set of the binaries that went into the
+      # image, the image's size, and the tags. Runs on a failure too - that is when they are wanted.
+      - name: Summary
+        if: always()
+        run: |
+          log="$RUNNER_TEMP/build-hip.log"
+          pat='BUILD.json:|AVX2 lines|check_hip_image|^image:|^package:|^CPU level:|^ROCm:'
+          pat="$pat|^llama.cpp:|^container tool:|PROBLEM|ABORT"
+          {
+            echo "### HIP image \`${ARCHS%%;*}\` at \`-$MARCH\`"
+            echo
+            if [ -f "$log" ]; then
+              echo '```'
+              grep -E "$pat" "$log" || true
+              echo '```'
+            else
+              echo "no build log: the step did not start"
+            fi
+            echo
+            echo "tags: \`${{ steps.tags.outputs.remote }}\`"
+            echo
+            echo "Not proven here: the card. A hosted runner has no AMD GPU, so \`strata components engine\` in the"
+            echo "image says so on the runner; the run on a real card is docs/FORK_HIP_IMAGE.md's \"Start the image\"."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push
+        if: env.PUSH == 'true'
+        run: |
+          local="${{ steps.tags.outputs.local }}"
+          IFS=, read -ra remotes <<< "${{ steps.tags.outputs.remote }}"
+          for t in "${remotes[@]}"; do docker tag "$local" "$t" && docker push "$t"; done
+          printf 'pushed: %s\n' "${remotes[@]}"
